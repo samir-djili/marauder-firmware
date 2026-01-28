@@ -519,18 +519,168 @@ void WiFiSniffer::parseDataFrame(const uint8_t* frame, uint16_t len, int32_t rss
 }
 
 void WiFiSniffer::parseHandshakeFrame(const uint8_t* frame, uint16_t len, int32_t rssi, uint32_t channel) {
-    // Implement WPA handshake parsing logic
-    // This is a complex implementation that would parse EAPOL frames
-    // For now, we'll add a placeholder
+    if (len < 30) return; // Minimum for data frame with EAPOL
     
-    HandshakeData handshake;
-    handshake.apBSSID = macToString(&frame[16]);
-    handshake.clientMAC = macToString(&frame[10]);
-    handshake.timestamp = millis();
-    handshake.hasMsg1 = handshake.hasMsg2 = handshake.hasMsg3 = handshake.hasMsg4 = false;
+    // Check if this is a data frame (type 2)
+    uint8_t frameType = (frame[0] & 0x0C) >> 2;
+    if (frameType != 2) return;
     
-    // TODO: Implement full handshake parsing
-    handshakes.push_back(handshake);
+    // Skip to payload (after 802.11 header)
+    uint16_t payloadOffset = 24;
+    
+    // Check for QoS header
+    if ((frame[0] & 0x80) != 0) {
+        payloadOffset += 2; // QoS header is 2 bytes
+    }
+    
+    if (len <= payloadOffset + 8) return; // Need at least LLC header
+    
+    // Check for LLC/SNAP header (EAPOL)
+    const uint8_t* llc = &frame[payloadOffset];
+    if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03 || // LLC
+        llc[3] != 0x00 || llc[4] != 0x00 || llc[5] != 0x00 || // OUI
+        llc[6] != 0x88 || llc[7] != 0x8E) { // EtherType for EAPOL
+        return;
+    }
+    
+    // Parse EAPOL header
+    uint16_t eapolOffset = payloadOffset + 8;
+    if (len <= eapolOffset + 4) return;
+    
+    const uint8_t* eapol = &frame[eapolOffset];
+    uint8_t eapolVersion = eapol[0];
+    uint8_t eapolType = eapol[1];
+    uint16_t eapolLength = (eapol[2] << 8) | eapol[3];
+    
+    // We're interested in EAPOL-Key frames (type 3)
+    if (eapolType != 3) return;
+    
+    if (len < eapolOffset + 4 + eapolLength) return;
+    
+    // Parse EAPOL-Key header
+    const uint8_t* eapolKey = &eapol[4];
+    if (eapolLength < 95) return; // Minimum EAPOL-Key length
+    
+    uint8_t keyDescriptor = eapolKey[0];
+    uint16_t keyInfo = (eapolKey[1] << 8) | eapolKey[2];
+    uint16_t keyLength = (eapolKey[3] << 8) | eapolKey[4];
+    
+    // Extract key information
+    bool pairwise = (keyInfo & 0x0008) != 0;
+    bool install = (keyInfo & 0x0040) != 0;
+    bool ack = (keyInfo & 0x0080) != 0;
+    bool mic = (keyInfo & 0x0100) != 0;
+    bool secure = (keyInfo & 0x0200) != 0;
+    bool error = (keyInfo & 0x0400) != 0;
+    bool request = (keyInfo & 0x0800) != 0;
+    
+    // Determine which handshake message this is
+    uint8_t messageType = 0;
+    if (pairwise) {
+        if (ack && !mic) {
+            messageType = 1; // Message 1
+        } else if (!ack && mic && !secure) {
+            messageType = 2; // Message 2
+        } else if (ack && mic && secure) {
+            messageType = 3; // Message 3
+        } else if (!ack && mic && secure) {
+            messageType = 4; // Message 4
+        }
+    }
+    
+    if (messageType == 0) return; // Not a valid handshake message
+    
+    // Extract MAC addresses
+    String apBSSID = macToString(&frame[16]);
+    String clientMAC;
+    String apMAC;
+    
+    // Determine direction
+    if (messageType == 1 || messageType == 3) {
+        // AP -> Client
+        apMAC = macToString(&frame[10]);
+        clientMAC = macToString(&frame[4]);
+    } else {
+        // Client -> AP  
+        clientMAC = macToString(&frame[10]);
+        apMAC = macToString(&frame[4]);
+        apBSSID = apMAC;
+    }
+    
+    // Find or create handshake session
+    HandshakeData* handshake = nullptr;
+    for (auto& hs : handshakes) {
+        if (hs.apBSSID == apBSSID && hs.clientMAC == clientMAC) {
+            handshake = &hs;
+            break;
+        }
+    }
+    
+    if (!handshake) {
+        // Create new handshake session
+        HandshakeData newHandshake;
+        newHandshake.apBSSID = apBSSID;
+        newHandshake.clientMAC = clientMAC;
+        newHandshake.timestamp = millis();
+        newHandshake.hasMsg1 = newHandshake.hasMsg2 = newHandshake.hasMsg3 = newHandshake.hasMsg4 = false;
+        handshakes.push_back(newHandshake);
+        handshake = &handshakes.back();
+        
+        // Try to find SSID from known APs
+        for (const auto& ap : accessPoints) {
+            if (ap.bssid == apBSSID) {
+                handshake->ssid = ap.ssid;
+                break;
+            }
+        }
+    }
+    
+    // Store the handshake message
+    std::vector<uint8_t> frameData(frame, frame + len);
+    
+    switch (messageType) {
+        case 1:
+            if (!handshake->hasMsg1) {
+                handshake->hasMsg1 = true;
+                handshake->msg1 = frameData;
+                Serial.printf("[Sniffer] Captured handshake msg1: %s <-> %s\n", 
+                             apBSSID.c_str(), clientMAC.c_str());
+            }
+            break;
+        case 2:
+            if (!handshake->hasMsg2) {
+                handshake->hasMsg2 = true;
+                handshake->msg2 = frameData;
+                Serial.printf("[Sniffer] Captured handshake msg2: %s <-> %s\n", 
+                             apBSSID.c_str(), clientMAC.c_str());
+            }
+            break;
+        case 3:
+            if (!handshake->hasMsg3) {
+                handshake->hasMsg3 = true;
+                handshake->msg3 = frameData;
+                Serial.printf("[Sniffer] Captured handshake msg3: %s <-> %s\n", 
+                             apBSSID.c_str(), clientMAC.c_str());
+            }
+            break;
+        case 4:
+            if (!handshake->hasMsg4) {
+                handshake->hasMsg4 = true;
+                handshake->msg4 = frameData;
+                Serial.printf("[Sniffer] Captured handshake msg4: %s <-> %s\n", 
+                             apBSSID.c_str(), clientMAC.c_str());
+            }
+            break;
+    }
+    
+    // Check if we have a complete handshake (need at least msg1+msg2 or msg2+msg3)
+    bool isComplete = (handshake->hasMsg1 && handshake->hasMsg2) || 
+                     (handshake->hasMsg2 && handshake->hasMsg3);
+    
+    if (isComplete) {
+        Serial.printf("[Sniffer] COMPLETE HANDSHAKE captured for %s (%s)\n", 
+                     handshake->ssid.c_str(), apBSSID.c_str());
+    }
 }
 
 void WiFiSniffer::addOrUpdateAP(const AccessPoint& ap) {
